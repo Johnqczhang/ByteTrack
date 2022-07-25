@@ -10,14 +10,11 @@ http://arxiv.org/abs/1512.02325
 """
 
 import cv2
-import numpy as np
-
-import torch
-
-from yolox.utils import xyxy2cxcywh
-
 import math
 import random
+import numpy as np
+
+from yolox.utils import xyxy2cxcywh
 
 
 def augment_hsv(img, hgain=0.015, sgain=0.7, vgain=0.4):
@@ -219,55 +216,39 @@ class TrainTransform:
         self.max_labels = max_labels
 
     def __call__(self, image, targets, input_dim):
-        boxes = targets[:, :4].copy()
-        labels = targets[:, 4].copy()
-        ids = targets[:, 5].copy()
-        if len(boxes) == 0:
+        if len(targets) == 0:
             targets = np.zeros((self.max_labels, 6), dtype=np.float32)
-            image, r_o = preproc(image, input_dim, self.means, self.std)
+            image, _ = preproc(image, input_dim, self.means, self.std)
             image = np.ascontiguousarray(image, dtype=np.float32)
             return image, targets
 
-        image_o = image.copy()
-        targets_o = targets.copy()
-        height_o, width_o, _ = image_o.shape
-        boxes_o = targets_o[:, :4]
-        labels_o = targets_o[:, 4]
-        ids_o = targets_o[:, 5]
-        # bbox_o: [xyxy] to [c_x,c_y,w,h]
-        boxes_o = xyxy2cxcywh(boxes_o)
+        boxes = targets[:, 0:4].copy()  # (n, 4)
+        labels = targets[:, 4, None].copy()  # (n, 1)
+        ids = targets[:, 5, None].copy()  # (n, 1)
 
         image_t = _distort(image)
         image_t, boxes = _mirror(image_t, boxes)
-        height, width, _ = image_t.shape
-        image_t, r_ = preproc(image_t, input_dim, self.means, self.std)
-        # boxes [xyxy] 2 [cx,cy,w,h]
-        boxes = xyxy2cxcywh(boxes)
-        boxes *= r_
+        image_t, ratio = preproc(image_t, input_dim, self.means, self.std)
 
-        mask_b = np.minimum(boxes[:, 2], boxes[:, 3]) > 1
-        boxes_t = boxes[mask_b]
-        labels_t = labels[mask_b]
-        ids_t = ids[mask_b]
+        # convert boxes from [x1, y1, x2, y2] to [cx, cy, w, h]
+        boxes = xyxy2cxcywh(boxes) * ratio
+        # keep valid boxes which width and height are greater than 1
+        keep = boxes[:, 2:4].min(axis=1) > 1
+        if keep.any():
+            boxes = boxes[keep]
+            labels = labels[keep]
+            ids = ids[keep]
+        else:
+            image_t, ratio = preproc(image, input_dim, self.means, self.std)
+            boxes = xyxy2cxcywh(targets[:, 0:4].copy()) * ratio
 
-        if len(boxes_t) == 0:
-            image_t, r_o = preproc(image_o, input_dim, self.means, self.std)
-            boxes_o *= r_o
-            boxes_t = boxes_o
-            labels_t = labels_o
-            ids_t = ids_o
-
-        labels_t = np.expand_dims(labels_t, 1)
-        ids_t = np.expand_dims(ids_t, 1)
-
-        targets_t = np.hstack((labels_t, boxes_t, ids_t))
-        padded_labels = np.zeros((self.max_labels, 6))
-        padded_labels[range(len(targets_t))[: self.max_labels]] = targets_t[
-            : self.max_labels
-        ]
-        padded_labels = np.ascontiguousarray(padded_labels, dtype=np.float32)
+        targets_t = np.hstack((labels, boxes, ids))[:self.max_labels]
+        padded_targets = np.pad(
+            targets_t, ((0, self.max_labels - len(targets_t)), (0, 0))
+        )
+        padded_targets = np.ascontiguousarray(padded_targets, dtype=np.float32)
         image_t = np.ascontiguousarray(image_t, dtype=np.float32)
-        return image_t, padded_labels
+        return image_t, padded_targets
 
 
 class ValTransform:

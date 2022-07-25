@@ -66,6 +66,10 @@ class Trainer:
             mode="a",
         )
 
+    @property
+    def no_aug(self):
+        return self.start_epoch >= self.max_epoch - self.exp.no_aug_epochs
+
     def train(self):
         self.before_train()
         try:
@@ -91,8 +95,6 @@ class Trainer:
         iter_start_time = time.time()
 
         inps, targets = self.prefetcher.next()
-        track_ids = targets[:, :, 5]
-        targets = targets[:, :, :5]
         inps = inps.to(self.data_type)
         targets = targets.to(self.data_type)
         targets.requires_grad = False
@@ -141,7 +143,6 @@ class Trainer:
         model = self.resume_train(model)
 
         # data related init
-        self.no_aug = self.start_epoch >= self.max_epoch - self.exp.no_aug_epochs
         self.train_loader = self.exp.get_data_loader(
             batch_size=self.args.batch_size,
             is_distributed=self.is_distributed,

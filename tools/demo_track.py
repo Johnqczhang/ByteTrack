@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import time
 import cv2
+import json
 import torch
 
 from loguru import logger
@@ -35,6 +36,18 @@ def make_parser():
         "--save_result",
         action="store_true",
         help="whether to save the inference result of image/video",
+    )
+    parser.add_argument(
+        "--save_video",
+        action="store_true",
+        help="whether to generate a video from the saved images with predictions",
+    )
+    # detection json file
+    parser.add_argument(
+        "--det_json",
+        default=None,
+        type=str,
+        help="the detection results saved as COCO format in a json file."
     )
 
     # exp file
@@ -78,15 +91,18 @@ def make_parser():
         help="Using TensorRT model for testing.",
     )
     # tracking args
-    parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
-    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
+    parser.add_argument("--det_thresh_hi", type=float, default=0.6, help="high score detection threshold")
+    parser.add_argument("--det_thresh_lo", type=float, default=0.1, help="low score detection threshold")
+    parser.add_argument("--track_thresh", type=float, default=0.6, help="threshold for initializing a new track")
+    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keeping lost tracks")
     parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
     parser.add_argument(
-        "--aspect_ratio_thresh", type=float, default=1.6,
-        help="threshold for filtering out boxes of which aspect ratio are above the given value."
+        "--max_aspect_ratio", type=float, default=1.6,
+        help="filter out boxes of which aspect ratio (width/height) is above the given value."
     )
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument("--with_deduplication", action="store_false", help="Whether to remove duplicate tracks.")
     return parser
 
 
@@ -130,6 +146,7 @@ class Predictor(object):
         self.confthre = exp.test_conf
         self.nmsthre = exp.nmsthre
         self.test_size = exp.test_size
+        self.detections = exp.detections
         self.device = device
         self.fp16 = fp16
         if trt_file is not None:
@@ -144,7 +161,7 @@ class Predictor(object):
         self.rgb_means = (0.485, 0.456, 0.406)
         self.std = (0.229, 0.224, 0.225)
 
-    def inference(self, img, timer):
+    def inference(self, img):
         img_info = {"id": 0}
         if isinstance(img, str):
             img_info["file_name"] = osp.basename(img)
@@ -164,15 +181,41 @@ class Predictor(object):
             img = img.half()  # to FP16
 
         with torch.no_grad():
-            timer.tic()
             outputs = self.model(img)
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre, self.nmsthre
             )
-            #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
+
+
+def infer_from_detections(img_path, dets_list):
+    filename = osp.basename(img_path)
+    frame_id = int(filename.split('.')[0])
+    img = cv2.imread(img_path)
+    height, width = img.shape[:2]
+    img_info = {
+        "id": frame_id,
+        "height": height,
+        "width": width,
+        "raw_img": img,
+    }
+    # select detection results predicted in the current frame
+    detections = [
+        det for det in dets_list if det["frame_id"] == frame_id
+    ]
+    if len(detections) == 0:
+        return [None], img_info
+    # each row: (x1, y1, w, h, obj_conf=1, class_conf, class_id)
+    detections = torch.stack([
+        torch.tensor(det["bbox"] + [1, det["score"], det["category_id"]]).float()
+        for det in detections
+    ], dim=0)
+    # convert bbox format from x1y1wh to x1y1x2y2
+    detections[:, 2:4] += detections[:, 0:2]
+
+    return [detections], img_info
 
 
 def image_demo(predictor, vis_folder, current_time, args):
@@ -181,12 +224,17 @@ def image_demo(predictor, vis_folder, current_time, args):
     else:
         files = [args.path]
     files.sort()
-    tracker = BYTETracker(args, frame_rate=args.fps)
+    tracker = BYTETracker(args, frame_rate=args.fps, det_thresh=[args.det_thresh_lo, args.det_thresh_hi])
     timer = Timer()
     results = []
 
-    for frame_id, img_path in enumerate(files, 1):
-        outputs, img_info = predictor.inference(img_path, timer)
+    for frame_id, img in enumerate(files, 1):
+        timer.tic()
+        if predictor.model is None:
+            outputs, img_info = infer_from_detections(img, args.detections)
+        else:
+            outputs, img_info = predictor.inference(img)
+
         if outputs[0] is not None:
             online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
             online_tlwhs = []
@@ -195,12 +243,10 @@ def image_demo(predictor, vis_folder, current_time, args):
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-                vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                if (tlwh[2] * tlwh[3] > args.min_box_area) and (tlwh[2] / tlwh[3] <= args.max_aspect_ratio):
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     online_scores.append(t.score)
-                    # save results
                     results.append(
                         f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
@@ -212,12 +258,14 @@ def image_demo(predictor, vis_folder, current_time, args):
             timer.toc()
             online_im = img_info['raw_img']
 
-        # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
-            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
+            if hasattr(args, "save_folder") and args.save_folder is not None:
+                save_folder = args.save_folder
+            else:
+                timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+                save_folder = osp.join(vis_folder, timestamp, "imgs")
             os.makedirs(save_folder, exist_ok=True)
-            cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
+            cv2.imwrite(osp.join(save_folder, osp.basename(img)), online_im)
 
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
@@ -226,11 +274,25 @@ def image_demo(predictor, vis_folder, current_time, args):
         if ch == 27 or ch == ord("q") or ch == ord("Q"):
             break
 
-    if args.save_result:
+    if hasattr(args, "res_file") and args.res_file is not None:
+        res_file = args.res_file
+    else:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
-            f.writelines(results)
-        logger.info(f"save results to {res_file}")
+    with open(res_file, 'w') as f:
+        f.writelines(results)
+    print(f"Tracking results saved in {res_file}. Speed: {timer.calls / timer.total_time:.2f} fps.")
+
+    if args.save_video:
+        if hasattr(args, "vis_file") and args.vis_file is not None:
+            vis_file = args.vis_file
+        else:
+            vis_file = osp.join(vis_folder, f"{timestamp}.mp4")
+        cmd = (
+            f"ffmpeg -threads 2 -y -f image2 -r {args.fps} -i {save_folder}/%06d.jpg "
+            f"-b:v 5000k -c:v mpeg4 {vis_file}"
+        )
+        os.system(cmd)
+        print(f"Tracking visualization saved in {vis_file}")
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -249,7 +311,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     vid_writer = cv2.VideoWriter(
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
     )
-    tracker = BYTETracker(args, frame_rate=30)
+    tracker = BYTETracker(args, frame_rate=fps, det_thresh=[args.det_thresh_lo, args.det_thresh_hi])
     timer = Timer()
     frame_id = 0
     results = []
@@ -267,8 +329,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
-                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                    if (tlwh[2] * tlwh[3] > args.min_box_area) and (tlwh[2] / tlwh[3] <= args.max_aspect_ratio):
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
                         online_scores.append(t.score)
@@ -322,29 +383,39 @@ def main(exp, args):
     if args.tsize is not None:
         exp.test_size = (args.tsize, args.tsize)
 
-    model = exp.get_model().to(args.device)
-    logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    model.eval()
+    if args.det_json is not None:
+        assert osp.exists(args.det_json)
+        with open(args.det_json, 'r') as f:
+            exp.detections = json.load(f)
+        assert len(exp.detections) > 0, f"Error: loaded empty detections from {args.det_json}"
+        logger.info(f"Loaded {len(exp.detections)} detections from {args.det_json}")
+        model = None
+        exp.test_size = []
+    else:
+        exp.detections = []
+        model = exp.get_model().to(args.device)
+        logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
+        model.eval()
 
-    if not args.trt:
-        if args.ckpt is None:
-            ckpt_file = osp.join(output_dir, "best_ckpt.pth.tar")
-        else:
-            ckpt_file = args.ckpt
-        logger.info("loading checkpoint")
-        ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
-        model.load_state_dict(ckpt["model"])
-        logger.info("loaded checkpoint done.")
+        if not args.trt:
+            if args.ckpt is None:
+                ckpt_file = osp.join(output_dir, "best_ckpt.pth.tar")
+            else:
+                ckpt_file = args.ckpt
+            logger.info("loading checkpoint")
+            ckpt = torch.load(ckpt_file, map_location="cpu")
+            # load the model state dict
+            model.load_state_dict(ckpt["model"])
+            logger.info("loaded checkpoint done.")
 
-    if args.fuse:
-        logger.info("\tFusing model...")
-        model = fuse_model(model)
+        if args.fuse:
+            logger.info("\tFusing model...")
+            model = fuse_model(model)
 
-    if args.fp16:
-        model = model.half()  # to FP16
+        if args.fp16:
+            model = model.half()  # to FP16
 
-    if args.trt:
+    if args.trt and model is not None:
         assert not args.fuse, "TensorRT model is not support model fusing!"
         trt_file = osp.join(output_dir, "model_trt.pth")
         assert osp.exists(

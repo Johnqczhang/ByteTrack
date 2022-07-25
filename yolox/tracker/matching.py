@@ -79,7 +79,7 @@ def iou_distance(atracks, btracks):
     :rtype cost_matrix np.ndarray
     """
 
-    if (len(atracks)>0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
+    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
         atlbrs = atracks
         btlbrs = btracks
     else:
@@ -99,7 +99,7 @@ def v_iou_distance(atracks, btracks):
     :rtype cost_matrix np.ndarray
     """
 
-    if (len(atracks)>0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
+    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
         atlbrs = atracks
         btlbrs = btracks
     else:

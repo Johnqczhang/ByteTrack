@@ -1,22 +1,21 @@
-from loguru import logger
-
-import torch
-import torch.backends.cudnn as cudnn
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-from yolox.core import launch
-from yolox.exp import get_exp
-from yolox.utils import configure_nccl, fuse_model, get_local_rank, get_model_info, setup_logger
-from yolox.evaluators import MOTEvaluator
-
 import argparse
 import os
 import random
 import warnings
 import glob
 import motmetrics as mm
+import torch
+import torch.backends.cudnn as cudnn
+
+from loguru import logger
 from collections import OrderedDict
 from pathlib import Path
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from yolox.core import launch
+from yolox.exp import get_exp
+from yolox.utils import fuse_model, get_model_info, setup_logger
+from yolox.evaluators import MOTEvaluator
 
 
 def make_parser():
@@ -105,7 +104,7 @@ def make_parser():
     parser.add_argument("--track_thresh", type=float, default=0.6, help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
     parser.add_argument("--match_thresh", type=float, default=0.9, help="matching threshold for tracking")
-    parser.add_argument("--min-box-area", type=float, default=100, help='filter out tiny boxes')
+    parser.add_argument("--min_box_area", type=float, default=100, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
     return parser
 
@@ -139,11 +138,9 @@ def main(exp, args, num_gpu):
     # set environment variables for distributed training
     cudnn.benchmark = True
 
-    rank = args.local_rank
-    # rank = get_local_rank()
-
     file_name = os.path.join(exp.output_dir, args.experiment_name)
 
+    rank = args.local_rank
     if rank == 0:
         os.makedirs(file_name, exist_ok=True)
 
@@ -162,7 +159,6 @@ def main(exp, args, num_gpu):
 
     model = exp.get_model()
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    #logger.info("Model Structure:\n{}".format(str(model)))
 
     val_loader = exp.get_eval_loader(args.batch_size, is_distributed, args.test)
     evaluator = MOTEvaluator(
@@ -172,7 +168,7 @@ def main(exp, args, num_gpu):
         confthre=exp.test_conf,
         nmsthre=exp.nmsthre,
         num_classes=exp.num_classes,
-        )
+    )
 
     torch.cuda.set_device(rank)
     model.cuda(rank)
