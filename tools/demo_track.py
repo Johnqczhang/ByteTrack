@@ -218,6 +218,32 @@ def infer_from_detections(img_path, dets_list):
     return [detections], img_info
 
 
+def ht21_demo(predictor, vis_folder, current_time, args):
+    is_train = "train" in args.demo
+    seqs_path = osp.join(
+        osp.dirname(__file__), "../datasets/mot/HT21", "train" if is_train else "test"
+    )
+    seqs_name = sorted([
+        seq for seq in os.listdir(seqs_path) if seq.startswith("HT21")
+    ])
+    save_dir = osp.join(vis_folder, time.strftime("%Y%m%d_%H%M%S", current_time))
+    os.makedirs(save_dir, exist_ok=True)
+
+    for seq_name in seqs_name:
+        seq_id = int(seq_name[-2:])
+        # image path
+        args.path = osp.join(seqs_path, seq_name, "img1")
+        args.save_folder = osp.join(save_dir, seq_name)
+        args.res_file = osp.join(save_dir, f"{seq_name}.txt")
+        args.vis_file = osp.join(save_dir, f"{seq_name}.mp4")
+        # select detections of current sequence from the list of json results
+        if predictor.detections is not None:
+            args.detections = [
+                det for det in predictor.detections if det["seq_id"] == seq_id
+            ]
+        image_demo(predictor, vis_folder, current_time, args)
+
+
 def image_demo(predictor, vis_folder, current_time, args):
     if osp.isdir(args.path):
         files = get_image_list(args.path)
@@ -430,7 +456,10 @@ def main(exp, args):
 
     predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
-    if args.demo == "image":
+    if args.demo.startswith("ht21"):
+        assert args.demo in ["ht21-train", "ht21-test"]
+        ht21_demo(predictor, vis_folder, current_time, args)
+    elif args.demo == "image":
         image_demo(predictor, vis_folder, current_time, args)
     elif args.demo == "video" or args.demo == "webcam":
         imageflow_demo(predictor, vis_folder, current_time, args)
